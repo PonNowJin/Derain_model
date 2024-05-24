@@ -1,0 +1,166 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.utils as vutils
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from dataset import RainRemovalDataset
+import torch.nn.functional as F
+
+model_name = 'final_model.pth'
+
+class GuidedFilter(nn.Module):
+    def __init__(self, radius, eps):
+        super(GuidedFilter, self).__init__()
+        self.radius = radius
+        self.eps = eps
+
+    def box_filter(self, x, r):
+        """Box filter implementation."""
+        ch = x.shape[1]
+        kernel_size = 2 * r + 1
+        box_kernel = torch.ones((ch, 1, kernel_size, kernel_size), dtype=x.dtype, device=x.device)
+        return F.conv2d(x, box_kernel, padding=r, groups=ch)
+
+    def forward(self, I, p):
+        r = self.radius
+        eps = self.eps
+        N = self.box_filter(torch.ones_like(I), r)
+
+        mean_I = self.box_filter(I, r) / N
+        mean_p = self.box_filter(p, r) / N
+        mean_Ip = self.box_filter(I * p, r) / N
+
+        cov_Ip = mean_Ip - mean_I * mean_p
+
+        mean_II = self.box_filter(I * I, r) / N
+        var_I = mean_II - mean_I * mean_I
+
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+
+        mean_a = self.box_filter(a, r) / N
+        mean_b = self.box_filter(b, r) / N
+
+        q = mean_a * I + mean_b
+        return q
+
+class RainRemovalNet(nn.Module):
+    def __init__(self, num_features=32, num_channels=3, kernel_size=3):
+        super(RainRemovalNet, self).__init__()
+        self.guided_filter = GuidedFilter(20, 1e-2)
+        self.conv1 = nn.Conv2d(num_channels, num_features, kernel_size, padding=1)
+        self.bn1 = nn.BatchNorm2d(num_features)
+        self.relu = nn.ReLU()
+
+        layers = []
+        for _ in range(16):
+            layers.append(nn.Conv2d(num_features, num_features, kernel_size, padding=1))
+            layers.append(nn.BatchNorm2d(num_features))
+            layers.append(nn.ReLU())
+
+        self.residual_layers = nn.Sequential(*layers)
+        self.conv_final = nn.Conv2d(num_features, num_channels, kernel_size, padding=1)
+        self.bn_final = nn.BatchNorm2d(num_channels)
+
+    def forward(self, x):
+        base = self.guided_filter(x, x)  # 使用導向濾波器分解圖像
+        detail = x - base  # 獲取細節層
+
+        out = self.relu(self.bn1(self.conv1(detail)))  # 第一層卷積、批歸一化和ReLU激活
+        out_shortcut = out
+
+        for i in range(12):  # 12層殘差塊
+            out = self.residual_layers[3 * i](out_shortcut)
+            out = self.residual_layers[3 * i + 1](out)
+            out = self.residual_layers[3 * i + 2](out)
+            out_shortcut = out_shortcut + out  # 殘差連接
+
+        neg_residual = self.bn_final(self.conv_final(out_shortcut))  # 最後一層卷積和批歸一化
+        final_out = x + neg_residual  # 輸出去雨後的圖像
+
+        return final_out
+
+# 配置設備
+device = torch.device('mps' if torch.backends.mps.is_built() else 'cuda' if torch.cuda.is_available() else 'cpu')
+
+# 數據預處理
+# 数据预处理
+transform = transforms.Compose([
+    transforms.Resize((384, 512)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+
+# 加載數據集和數據加載器
+train_dataset = RainRemovalDataset('/Users/ponfu/PycharmProject/IEEE_image_process/rainy_image_dataset/training_less', train=True, transform=transform)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+val_dataset = RainRemovalDataset('/Users/ponfu/PycharmProject/IEEE_image_process/rainy_image_dataset/testing_less', train=True, transform=transform)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+
+# 初始化網路和優化器
+net = RainRemovalNet().to(device)
+optimizer = optim.Adam(net.parameters(), lr=1e-4)
+criterion = nn.MSELoss()
+
+model_path = model_name
+if os.path.exists(model_path):
+    print("Load model successfully.")
+    checkpoint = torch.load(model_path, map_location=device)
+    net.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+else:
+    print("Train new model.")
+
+# 訓練網路
+num_epochs = 3
+for epoch in range(num_epochs):
+    net.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(train_loader):
+        inputs, labels = inputs.to(device), labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item()
+        if i % 10 == 9:
+            print(f'Epoch {epoch+1}, Batch {i+1}, Loss: {running_loss / 10:.4f}')
+            running_loss = 0.0
+
+    torch.save(net.state_dict(), f'rain_removal_epoch_{epoch+1}.pth')
+
+torch.save({
+    'model_state_dict': net.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+}, model_name)
+
+print('Finished Training')
+
+# 驗證網路
+net.eval()
+val_loss = 0.0
+with torch.no_grad():
+    for i, (inputs, labels) in enumerate(val_loader):
+        inputs, labels = inputs.to(device), labels.to(device)
+        outputs = net(inputs)
+        loss = criterion(outputs, labels)
+        val_loss += loss.item()
+
+        # 保存測試輸出的圖片
+        for j in range(outputs.size(0)):
+            output_image = outputs[j].cpu()
+            output_image = (output_image - output_image.min()) / (output_image.max() - output_image.min())
+            output_dir = 'Train_IEEE_output_less'
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, f'image_{i * val_loader.batch_size + j + 1}.png')
+            vutils.save_image(output_image, output_path)
+            print(f'Saved: {output_path}')
+
+val_loss /= len(val_loader)
+print(f'Validation Loss: {val_loss:.4f}')
